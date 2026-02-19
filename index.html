@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>早押しクイズ連携アプリ - 7台対応</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+    <!-- Firebase App (Compat) -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #475569; border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-slate-900 text-white">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Firebase Configuration
+        const firebaseConfig = JSON.parse(__firebase_config);
+        
+        // Initialize Firebase using Compat SDK for browser stability
+        if (!firebase.apps.length) {
+            firebase.initializeApp(firebaseConfig);
+        }
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'quiz-buzzer-v2';
+
+        const { useState, useEffect, useCallback } = React;
+
+        // Icon Component helper
+        const Icon = ({ name, size = 24, className = "" }) => {
+            useEffect(() => {
+                if (window.lucide) {
+                    lucide.createIcons();
+                }
+            }, [name]);
+            return <i data-lucide={name} className={className} style={{ width: size, height: size, display: 'inline-block' }}></i>;
+        };
+
+        const App = () => {
+            const [user, setUser] = useState(null);
+            const [gameState, setGameState] = useState({ isActive: false, lastReset: Date.now() });
+            const [results, setResults] = useState([]);
+            const [role, setRole] = useState(null);
+            const [userName, setUserName] = useState('');
+            const [hasPushed, setHasPushed] = useState(false);
+
+            // 1. Auth Logic
+            useEffect(() => {
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await auth.signInWithCustomToken(__initial_auth_token);
+                        } else {
+                            await auth.signInAnonymously();
+                        }
+                    } catch (err) {
+                        console.error("Auth error:", err);
+                    }
+                };
+                initAuth();
+                const unsubscribe = auth.onAuthStateChanged((u) => {
+                    setUser(u);
+                    setTimeout(() => lucide.createIcons(), 0);
+                });
+                return () => unsubscribe();
+            }, []);
+
+            // 2. Real-time Listeners
+            useEffect(() => {
+                if (!user) return;
+
+                const gameDocRef = db.doc(`artifacts/${appId}/public/data/control/state`);
+                const unsubscribeControl = gameDocRef.onSnapshot((snapshot) => {
+                    if (snapshot.exists) {
+                        const data = snapshot.data();
+                        setGameState(data);
+                        if (data.isActive) setHasPushed(false);
+                    } else {
+                        gameDocRef.set({ isActive: false, lastReset: Date.now() });
+                    }
+                    setTimeout(() => lucide.createIcons(), 0);
+                }, (err) => console.error("Control snapshot error:", err));
+
+                const resultsColRef = db.collection(`artifacts/${appId}/public/data/results`);
+                const unsubscribeResults = resultsColRef.onSnapshot((snapshot) => {
+                    const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                    const sorted = docs.sort((a, b) => a.timestamp - b.timestamp);
+                    setResults(sorted);
+                    setTimeout(() => lucide.createIcons(), 0);
+                }, (err) => console.error("Results snapshot error:", err));
+
+                return () => {
+                    unsubscribeControl();
+                    unsubscribeResults();
+                };
+            }, [user]);
+
+            const handleJoin = (selectedRole) => {
+                if (!userName.trim()) return;
+                setRole(selectedRole);
+                setTimeout(() => lucide.createIcons(), 100);
+            };
+
+            const pushBuzzer = async () => {
+                if (!user || !gameState.isActive || hasPushed || role !== 'player') return;
+                const pushTime = Date.now();
+                setHasPushed(true);
+                try {
+                    const resultDocRef = db.doc(`artifacts/${appId}/public/data/results/${user.uid}`);
+                    await resultDocRef.set({
+                        userId: user.uid,
+                        name: String(userName),
+                        timestamp: Number(pushTime),
+                        diff: Number(pushTime - gameState.lastReset)
+                    });
+                } catch (err) {
+                    console.error("Push error:", err);
+                    setHasPushed(false);
+                }
+            };
+
+            const startNewRound = async () => {
+                if (role !== 'host' || !user) return;
+                try {
+                    const resultsColRef = db.collection(`artifacts/${appId}/public/data/results`);
+                    const snapshot = await resultsColRef.get();
+                    const batch = db.batch();
+                    snapshot.docs.forEach(d => batch.delete(d.ref));
+                    await batch.commit();
+
+                    const gameDocRef = db.doc(`artifacts/${appId}/public/data/control/state`);
+                    await gameDocRef.update({ isActive: true, lastReset: Date.now() });
+                } catch (err) {
+                    console.error("Start error:", err);
+                }
+            };
+
+            const deactivateBuzzer = async () => {
+                if (role !== 'host' || !user) return;
+                const gameDocRef = db.doc(`artifacts/${appId}/public/data/control/state`);
+                await gameDocRef.update({ isActive: false });
+            };
+
+            const getRank = () => {
+                const idx = results.findIndex(r => r.userId === user?.uid);
+                return idx !== -1 ? idx + 1 : null;
+            };
+
+            if (!role) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-6 bg-slate-900 text-white">
+                        <div className="w-full max-w-md bg-slate-800 rounded-3xl p-8 shadow-2xl border border-slate-700">
+                            <h1 className="text-3xl font-bold text-center mb-8 flex flex-col items-center gap-2">
+                                <div className="flex items-center gap-3">
+                                    <Icon name="timer" className="text-yellow-400" size={32} />
+                                    <span>早押しクイズ</span>
+                                </div>
+                                <span className="text-sm font-normal text-slate-400 tracking-widest uppercase text-xs">7 Terminal Mode</span>
+                            </h1>
+                            <div className="space-y-6">
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-400 mb-2 ml-1">ニックネーム (必須)</label>
+                                    <input 
+                                        type="text" 
+                                        maxLength={10}
+                                        value={userName}
+                                        onChange={(e) => setUserName(e.target.value)}
+                                        placeholder="名前を入力"
+                                        className="w-full bg-slate-700 border-none rounded-xl py-4 px-4 text-white text-lg focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                                    />
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                    <button onClick={() => handleJoin('player')} disabled={!userName.trim()}
+                                        className="flex flex-col items-center justify-center gap-2 p-6 bg-blue-600 hover:bg-blue-500 disabled:opacity-30 rounded-2xl transition-all shadow-lg">
+                                        <Icon name="user" size={32} />
+                                        <span className="font-bold">プレイヤー</span>
+                                    </button>
+                                    <button onClick={() => handleJoin('host')} disabled={!userName.trim()}
+                                        className="flex flex-col items-center justify-center gap-2 p-6 bg-purple-600 hover:bg-purple-500 disabled:opacity-30 rounded-2xl transition-all shadow-lg">
+                                        <Icon name="crown" size={32} />
+                                        <span className="font-bold">ホスト</span>
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+
+            const rankValue = getRank();
+
+            return (
+                <div className="min-h-screen flex flex-col overflow-hidden bg-slate-900 text-white">
+                    <header className="bg-slate-800 border-b border-slate-700 p-4 flex justify-between items-center shadow-md z-10">
+                        <div className="flex items-center gap-3">
+                            <div className={`p-2 rounded-lg ${role === 'host' ? 'bg-purple-600' : 'bg-blue-600'}`}>
+                                <Icon name={role === 'host' ? 'crown' : 'user'} size={18} />
+                            </div>
+                            <div>
+                                <div className="font-bold leading-none mb-1">{userName}</div>
+                                <div className="text-[10px] text-slate-400 uppercase tracking-widest">{role} mode</div>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <div className="hidden sm:flex items-center gap-2 bg-slate-900 px-3 py-1.5 rounded-full border border-slate-700 text-xs font-bold">
+                                <Icon name="users" size={14} className="text-slate-400" />
+                                <span>{results.length} / 6</span>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <div className={`w-3 h-3 rounded-full ${gameState.isActive ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
+                                <span className="text-xs font-bold uppercase">{gameState.isActive ? 'ON' : 'OFF'}</span>
+                            </div>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 flex flex-col lg:flex-row p-4 gap-4 overflow-hidden">
+                        <div className="flex-[3] flex flex-col items-center justify-center bg-slate-800/40 rounded-3xl p-4 md:p-8 relative border border-slate-700/50">
+                            {role === 'player' ? (
+                                <div className="flex flex-col items-center gap-6">
+                                    <button onPointerDown={pushBuzzer} disabled={!gameState.isActive || hasPushed}
+                                        className={`relative w-64 h-64 md:w-80 md:h-80 rounded-full transition-all duration-75 select-none touch-none flex items-center justify-center shadow-[0_24px_0_0_rgba(153,27,27,1)] active:shadow-none active:translate-y-[24px]
+                                        ${!gameState.isActive ? 'bg-slate-700 shadow-slate-900 opacity-50' : hasPushed ? 'bg-green-600 shadow-none translate-y-[24px]' : 'bg-red-600 hover:bg-red-500'}`}>
+                                        <div className="text-5xl md:text-7xl font-black italic text-white drop-shadow-lg">{hasPushed ? 'DONE!' : 'PUSH'}</div>
+                                    </button>
+                                    <div className="text-center">
+                                        <p className={`text-lg font-bold ${gameState.isActive ? 'text-green-400' : 'text-slate-500'}`}>{gameState.isActive ? 'ボタンを押して！' : '合図を待ってください'}</p>
+                                        {hasPushed && rankValue && <div className="text-3xl font-black text-yellow-400 animate-bounce mt-2 italic">{rankValue}位！</div>}
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="w-full max-w-lg space-y-10 text-center">
+                                    <h2 className="text-3xl font-black tracking-tight uppercase italic">Game Master</h2>
+                                    <div className="grid gap-6 px-4">
+                                        <button onClick={startNewRound} className="group py-8 bg-green-600 hover:bg-green-500 rounded-3xl font-black text-2xl flex items-center justify-center gap-4 transition-all shadow-[0_10px_0_0_rgba(22,101,52,1)] active:shadow-none active:translate-y-[10px]">
+                                            <Icon name="rotate-ccw" size={32} />
+                                            開始 / リセット
+                                        </button>
+                                        <button onClick={deactivateBuzzer} className="py-6 bg-slate-700 hover:bg-slate-600 border-2 border-slate-600 rounded-3xl font-bold text-xl flex items-center justify-center gap-3">
+                                            <Icon name="play" className="rotate-90" size={24} />
+                                            解答締め切り
+                                        </button>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-4 px-4">
+                                        <div className="p-6 bg-slate-900 rounded-2xl border border-slate-700">
+                                            <p className="text-slate-500 text-[10px] font-bold uppercase mb-1">回答数</p>
+                                            <div className="text-4xl font-black">{results.length} <span className="text-lg text-slate-500">/ 6</span></div>
+                                        </div>
+                                        <div className="p-6 bg-slate-900 rounded-2xl border border-slate-700">
+                                            <p className="text-slate-500 text-[10px] font-bold uppercase mb-1">状態</p>
+                                            <div className={`text-xl font-black uppercase ${gameState.isActive ? 'text-green-500' : 'text-red-500'}`}>{gameState.isActive ? 'READY' : 'STOP'}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="flex-[2] bg-slate-800 rounded-3xl p-6 shadow-2xl border border-slate-700 flex flex-col min-h-[400px]">
+                            <div className="flex items-center justify-between mb-8">
+                                <h3 className="text-2xl font-black flex items-center gap-3 italic"><Icon name="trophy" className="text-yellow-500" /> RANKING</h3>
+                            </div>
+                            <div className="flex-1 overflow-y-auto space-y-4 custom-scrollbar">
+                                {results.length === 0 ? (
+                                    <div className="h-full flex flex-col items-center justify-center text-slate-700 opacity-50">
+                                        <Icon name="timer" size={40} className="mb-4" />
+                                        <p className="font-bold uppercase tracking-widest text-sm">Waiting...</p>
+                                    </div>
+                                ) : (
+                                    results.slice(0, 6).map((res, index) => (
+                                        <div key={res.id} className={`flex items-center gap-4 p-4 rounded-2xl ${index === 0 ? 'bg-gradient-to-r from-yellow-600/20 to-transparent border-l-4 border-yellow-500' : 'bg-slate-700/40 border-l-4 border-slate-600'}`}>
+                                            <div className={`w-12 h-12 rounded-xl flex items-center justify-center font-black text-xl shadow-lg ${index === 0 ? 'bg-yellow-500 text-slate-900' : index === 1 ? 'bg-slate-300 text-slate-800' : index === 2 ? 'bg-amber-700 text-white' : 'bg-slate-600 text-slate-300'}`}>
+                                                {index + 1}
+                                            </div>
+                                            <div className="flex-1 min-w-0">
+                                                <div className="font-black text-lg truncate">{res.name}</div>
+                                                <div className="text-[10px] font-mono text-slate-500 flex items-center gap-2 mt-1 italic">
+                                                    <Icon name="timer" size={10} />
+                                                    {index === 0 ? 'WINNER' : `+${((res.timestamp - results[0].timestamp) / 1000).toFixed(3)}s`}
+                                                </div>
+                                            </div>
+                                            {index === 0 && <Icon name="crown" className="text-yellow-500 animate-pulse" size={24} />}
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        </div>
+                    </main>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
